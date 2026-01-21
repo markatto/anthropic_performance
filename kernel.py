@@ -168,13 +168,13 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
             # idx = mem[inp_indices_p + i]
             # This tells us where we currently are in the tree
             body.append(("alu", ("+", tmp_addr, kb.scratch["inp_indices_p"], i_const)))
-            body.append(("load", ("load", tmp_idx, tmp_addr)))
+            body.append(("load", ("load", tmp_idx, tmp_addr))) # TODO: this can be in scratch
             body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
 
             # val = mem[inp_values_p + i]
             # This is our running hash value that determines branching
             body.append(("alu", ("+", tmp_addr, kb.scratch["inp_values_p"], i_const)))
-            body.append(("load", ("load", tmp_val, tmp_addr)))
+            body.append(("load", ("load", tmp_val, tmp_addr))) # TODO: this can be in scratch
             body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
 
             # -----------------------------------------------------------------
@@ -183,7 +183,7 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
             # node_val = mem[forest_values_p + idx]
             # The tree is stored as a flat array; idx is the node index
             body.append(("alu", ("+", tmp_addr, kb.scratch["forest_values_p"], tmp_idx)))
-            body.append(("load", ("load", tmp_node_val, tmp_addr)))
+            body.append(("load", ("load", tmp_node_val, tmp_addr))) # this load is (mostly) necessary
             body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
 
             # -----------------------------------------------------------------
@@ -203,7 +203,9 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
             # If hash is odd, go to right child (2*idx + 2)
             body.append(("alu", ("%", tmp1, tmp_val, two_const)))      # tmp1 = val % 2
             body.append(("alu", ("==", tmp1, tmp1, zero_const)))       # tmp1 = (val % 2 == 0)
+            # TODO: alu can do this?
             body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))  # tmp3 = 1 or 2
+            # TODO: FMA?
             body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))   # idx = 2 * idx
             body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))        # idx = 2*idx + tmp3
             body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
@@ -213,6 +215,7 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
             # -----------------------------------------------------------------
             # idx = 0 if idx >= n_nodes else idx
             # If we've gone past the leaves, wrap back to root
+            #TODO: this could be a single mod, or fully unrolled or something
             body.append(("alu", ("<", tmp1, tmp_idx, kb.scratch["n_nodes"])))  # tmp1 = idx < n_nodes
             body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))  # idx = idx or 0
             body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
@@ -220,6 +223,7 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
             # -----------------------------------------------------------------
             # STEP 6: Store updated index and value back to memory
             # -----------------------------------------------------------------
+            # TODO: keep this in scratch
             # mem[inp_indices_p + i] = idx
             body.append(("alu", ("+", tmp_addr, kb.scratch["inp_indices_p"], i_const)))
             body.append(("store", ("store", tmp_addr, tmp_idx)))
