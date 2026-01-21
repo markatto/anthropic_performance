@@ -218,18 +218,17 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
             body.append(("flow", ("select", cur_node, tmp1, cur_node, zero_const)))  # idx = idx or 0
             body.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
 
-            # -----------------------------------------------------------------
-            # STEP 6: Store updated index and value back to memory
-            # -----------------------------------------------------------------
-            # TODO: keep this in scratch
+
+    for batch in range(batch_size):
+        batch_const = kb.scratch_const(batch)
             # mem[inp_indices_p + i] = idx
-            body.append(("alu", ("+", tmp_addr, kb.scratch["inp_indices_p"], batch_const)))
-            body.append(("store", ("store", tmp_addr, cur_node)))
+        body.append(("alu", ("+", tmp_addr, kb.scratch["inp_indices_p"], batch_const)))
+        body.append(("store", ("store", tmp_addr, instance_pointers + batch)))
 
-            # mem[inp_values_p + i] = val
-            body.append(("alu", ("+", tmp_addr, kb.scratch["inp_values_p"], batch_const)))
-            body.append(("store", ("store", tmp_addr, acc)))
-
+        # mem[inp_values_p + i] = val
+        body.append(("alu", ("+", tmp_addr, kb.scratch["inp_values_p"], batch_const)))
+        body.append(("store", ("store", tmp_addr, instance_accumulators + batch)))
+        
     # =========================================================================
     # FINALIZE: Convert slot list to instruction bundles
     # =========================================================================
