@@ -150,6 +150,9 @@ def build_batch_preload(
     (2 vloads per cycle). Reads and increments happen in the same bundle
     since reads occur before writes commit.
     """
+
+
+    #TODO: s.inp_indices_p / s.inp_values_p directly for the first vload?
     assert batch_size % VLEN == 0
     vlen_const = kb.scratch_const(VLEN)
     addr_i, addr_v = s.tmp1, s.tmp2
@@ -198,6 +201,18 @@ def build_batch_store(
     return instrs
 
 
+def build_parity_index(
+    s: ScratchLayout, acc: int, cur_node: int,
+) -> list[Instruction]:
+    """Compute next tree index from hash parity: idx = 2*idx + (1 if hash%2==0 else 2)."""
+    return [
+        ("alu", ("%", s.tmp1, acc, s.two_const)),
+        ("alu", ("+", s.tmp3, s.tmp1, s.one_const)),
+        ("alu", ("*", cur_node, cur_node, s.two_const)),
+        ("alu", ("+", cur_node, cur_node, s.tmp3)),
+    ]
+
+
 def build_main_loop_scalar(
     s: ScratchLayout,
     batch_size: int,
@@ -221,17 +236,55 @@ def build_main_loop_scalar(
             slots.extend(build_hash(acc, s.tmp1, s.tmp2, round, batch, const_fn))
             slots.append(("debug", ("compare", acc, (round, batch, "hashed_val"))))
 
-            # Compute next tree index based on hash parity
-            slots.append(("alu", ("%", s.tmp1, acc, s.two_const)))
-            slots.append(("alu", ("+", s.tmp3, s.tmp1, s.one_const)))
-            slots.append(("alu", ("*", cur_node, cur_node, s.two_const)))
-            slots.append(("alu", ("+", cur_node, cur_node, s.tmp3)))
+            # Compute next tree index and wrap
+            slots.extend(build_parity_index(s, acc, cur_node))
             slots.append(("debug", ("compare", cur_node, (round, batch, "next_idx"))))
-
-            # Wrap index back to root if we fell off the tree
             slots.append(("alu", ("<", s.tmp1, cur_node, s.n_nodes)))
             slots.append(("flow", ("select", cur_node, s.tmp1, cur_node, s.zero_const)))
             slots.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
+    return slots
+
+
+def build_main_loop_unrolled(
+    s: ScratchLayout,
+    batch_size: int,
+    rounds: int,
+    forest_height: int,
+    const_fn: Callable[[int], int],
+) -> list[Instruction]:
+    """Scalar main loop with depth-aware wrap elimination.
+
+    Since all batch indices start at root (depth 0), we can track depth
+    statically and eliminate all flow ops:
+    - Normal rounds (depth < forest_height): no wrap check needed
+    - Wrap rounds (depth == forest_height): force idx = 0 after index computation
+    """
+    slots: list[Instruction] = []
+    depth = 0
+    for round in range(rounds):
+        is_wrap = (depth == forest_height)
+        for batch in range(batch_size):
+            cur_node = s.instance_pointers + batch
+            acc = s.instance_accumulators + batch
+
+            # Load the value stored at current tree node
+            slots.append(("alu", ("+", s.tmp_addr, s.forest_values_p, cur_node)))
+            slots.append(("load", ("load", s.tmp_node_val, s.tmp_addr)))
+            slots.append(("debug", ("compare", s.tmp_node_val, (round, batch, "node_val"))))
+
+            # XOR with node value and apply hash function
+            slots.append(("alu", ("^", acc, acc, s.tmp_node_val)))
+            slots.extend(build_hash(acc, s.tmp1, s.tmp2, round, batch, const_fn))
+            slots.append(("debug", ("compare", acc, (round, batch, "hashed_val"))))
+
+            # Compute next tree index
+            slots.extend(build_parity_index(s, acc, cur_node))
+            slots.append(("debug", ("compare", cur_node, (round, batch, "next_idx"))))
+            if is_wrap:
+                slots.append(("alu", ("+", cur_node, s.zero_const, s.zero_const)))
+            slots.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
+
+        depth = 0 if is_wrap else depth + 1
     return slots
 
 
@@ -250,7 +303,9 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
 
     kb.instrs.extend(build_batch_preload(kb, batch_size, s))
 
-    loop_slots = build_main_loop_scalar(s, batch_size, rounds, kb.scratch_const)
+    loop_slots = build_main_loop_unrolled(
+        s, batch_size, rounds, forest_height, kb.scratch_const,
+    )
     kb.instrs.extend(kb.build(loop_slots))
 
     kb.instrs.extend(build_batch_store(kb, batch_size, s))
