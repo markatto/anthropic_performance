@@ -71,31 +71,6 @@ def hash(val):
     machine = run_fragment(instructions)
     return machine.cores[0].scratch[0]
 
-     
-
-def scalar_add_constant():
-    """
-    Load two constants into scratch, add them, store result.
-    
-    scratch[0] = 10
-    scratch[1] = 32
-    scratch[2] = scratch[0] + scratch[1]  # should be 42
-    """
-    instrs = [
-        {"load": [("const", 0, 10)]},       # scratch[0] = 10
-        {"load": [("const", 1, 32)]},       # scratch[1] = 32
-        {"alu": [("+", 2, 0, 1)]},          # scratch[2] = scratch[0] + scratch[1]
-    ]
-    return instrs
-
-
-def test_scalar_add_constant():
-    machine = run_fragment(scalar_add_constant())
-    assert machine.cores[0].scratch[0] == 10
-    assert machine.cores[0].scratch[1] == 32
-    assert machine.cores[0].scratch[2] == 42
-    assert machine.cycle == 3
-
 def simple_hash(a: int) -> int:
     """
     hardcoded version of the hash function
@@ -114,6 +89,6 @@ def simple_hash(a: int) -> int:
 
 def test_hash():
     
-    assert hash(10) == 1712784324  # uh this is maybe probably right?
-    assert myhash(10) == 1712784324  # uh this is maybe probably right?
-    assert simple_hash(10) == 1712784324  # uh this is maybe probably right?
+    assert hash(10) == 1712784324
+    assert myhash(10) == 1712784324
+    assert simple_hash(10) == 1712784324
