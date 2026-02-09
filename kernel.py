@@ -101,14 +101,18 @@ class ScratchLayout:
         self.tmp2 = alloc("tmp2")
         self.tmp3 = alloc("tmp3")
 
-        # load the memory header into named scratch slots
+        # Load the memory header into named scratch slots.
+        # Pipeline: each cycle loads field[i] while computing address for field[i+1].
         for i, name in enumerate(HEADER_FIELDS):
             alloc(name, 1)
-            kb.add("load", ("const", self.tmp1, i))
-            kb.add("load", ("load", kb.scratch[name], self.tmp1))
+        kb.instrs.append({"load": [("const", self.tmp1, 0)]})
+        for i, name in enumerate(HEADER_FIELDS):
+            loads: list[Slot] = [("load", kb.scratch[name], self.tmp1)]
+            if i + 1 < len(HEADER_FIELDS):
+                loads.append(("const", self.tmp1, i + 1))
+            kb.instrs.append({"load": loads})
 
-        kb.add("flow", ("pause",))
-        kb.add("debug", ("comment", "Starting loop"))
+        kb.instrs.append({"flow": [("pause",)]})
 
         self.tmp_node_val = alloc("tmp_node_val")
         self.tmp_addr = alloc("tmp_addr")
