@@ -69,7 +69,41 @@ Data sections:
 =============================================================================
 """
 
+from typing import Callable
+
 from problem import HASH_STAGES
+
+Slot = tuple
+Instruction = tuple[str, Slot]
+
+
+def build_hash(
+    val_addr: int,
+    tmp1: int,
+    tmp2: int,
+    round: int,
+    batch: int,
+    const_fn: Callable[[int], int],
+) -> list[Instruction]:
+    """
+    Generate instructions for the 6-stage hash function.
+
+    Each stage computes:
+        tmp1 = val op1 const1    (e.g., val + 0x7ED55D16)
+        tmp2 = val op3 const3    (e.g., val << 12)
+        val  = tmp1 op2 tmp2     (e.g., tmp1 + tmp2)
+
+    The operations mix addition, XOR, and bit shifts to thoroughly
+    scramble the input value. See HASH_STAGES in problem.py for the
+    specific constants and operations used.
+    """
+    slots: list[Instruction] = []
+    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        slots.append(("alu", (op1, tmp1, val_addr, const_fn(val1))))
+        slots.append(("alu", (op3, tmp2, val_addr, const_fn(val3))))
+        slots.append(("alu", (op2, val_addr, tmp1, tmp2)))
+        slots.append(("debug", ("compare", val_addr, (round, batch, "hash_stage", hi))))
+    return slots
 
 
 def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
@@ -140,26 +174,6 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
     instance_pointers = kb.alloc_scratch("instance_pointers", batch_size)
     instance_accumulators = kb.alloc_scratch("instance_accumulators", batch_size)
 
-    def build_hash(val_hash_addr, tmp1, tmp2, round, i):
-        """
-        Generate instructions for the 6-stage hash function.
-        
-        Each stage computes:
-            tmp1 = val op1 const1    (e.g., val + 0x7ED55D16)
-            tmp2 = val op3 const3    (e.g., val << 12)
-            val  = tmp1 op2 tmp2     (e.g., tmp1 + tmp2)
-        
-        The operations mix addition, XOR, and bit shifts to thoroughly
-        scramble the input value. See HASH_STAGES in problem.py for the
-        specific constants and operations used.
-        """
-        slots = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, kb.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, kb.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-        return slots
 
     # initialization
     for batch in range(batch_size):
@@ -192,7 +206,7 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
             # val = myhash(val ^ node_val)
             # XOR mixes in the tree node's value, then hash scrambles it
             body.append(("alu", ("^", acc, acc, tmp_node_val)))
-            body.extend(build_hash(acc, tmp1, tmp2, round, batch))
+            body.extend(build_hash(acc, tmp1, tmp2, round, batch, kb.scratch_const))
             body.append(("debug", ("compare", acc, (round, batch, "hashed_val"))))
 
             # -----------------------------------------------------------------
