@@ -74,7 +74,8 @@ from typing import Callable
 from problem import HASH_STAGES
 
 Slot = tuple
-Instruction = tuple[str, Slot]
+Instruction = tuple[str, Slot]  # ("engine", (op, ...))
+Bundle = dict[str, list[Slot]]  # {"engine": [(op, ...), ...], ...}
 
 
 HEADER_FIELDS = [
@@ -151,18 +152,30 @@ def build_hash(
 
 def build_batch_preload(
     kb, batch_size: int, s: ScratchLayout,
-) -> list[Instruction]:
+) -> list[Bundle]:
     """Load batch indices and accumulators from memory into scratch."""
-    slots: list[Instruction] = []
+    #TODO vload
+    instrs: list[Bundle] = []
     for batch in range(batch_size):
         batch_const = kb.scratch_const(batch)
-        #TODO we could maybe get a few cycles by jamming in more precomputation
-        #TODO vload
-        slots.append(("alu", ("+", s.tmp_addr, kb.scratch["inp_indices_p"], batch_const)))
-        slots.append(("load", ("load", s.instance_pointers + batch, s.tmp_addr)))
-        slots.append(("alu", ("+", s.tmp_addr, kb.scratch["inp_values_p"], batch_const)))
-        slots.append(("load", ("load", s.instance_accumulators + batch, s.tmp_addr)))
-    return slots
+        instrs.append({"alu": [("+", s.tmp_addr, kb.scratch["inp_indices_p"], batch_const)]})
+        instrs.append({"load": [("load", s.instance_pointers + batch, s.tmp_addr)]})
+        instrs.append({"alu": [("+", s.tmp_addr, kb.scratch["inp_values_p"], batch_const)]})
+        instrs.append({"load": [("load", s.instance_accumulators + batch, s.tmp_addr)]})
+    return instrs
+
+
+def build_batch_store(
+    kb, batch_size: int, s: ScratchLayout,
+) -> list[Bundle]:
+    """Store batch accumulators back to memory."""
+    #TODO vstore
+    instrs: list[Bundle] = []
+    for batch in range(batch_size):
+        batch_const = kb.scratch_const(batch)
+        instrs.append({"alu": [("+", s.tmp_addr, kb.scratch["inp_values_p"], batch_const)]})
+        instrs.append({"store": [("store", s.tmp_addr, s.instance_accumulators + batch)]})
+    return instrs
 
 
 def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
@@ -180,76 +193,48 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
     s = ScratchLayout(kb, batch_size)
 
     # =========================================================================
-    # MAIN LOOP BODY
+    # PRELOAD: Load batch state from memory into scratch
     # =========================================================================
-    # We build up the loop body as a list of (engine, slot) tuples, then convert
-    # to instruction bundles at the end. Currently this is fully unrolled:
-    # rounds * batch_size iterations with no actual loop instructions.
-    body = build_batch_preload(kb, batch_size, s)
+    kb.instrs.extend(build_batch_preload(kb, batch_size, s))
 
+    # =========================================================================
+    # MAIN LOOP: Fully unrolled rounds * batch_size iterations
+    # =========================================================================
+    # The main loop is still built as flat slots and packed via kb.build().
+    # This will get its own packing strategy later.
+    loop_slots: list[Instruction] = []
     for round in range(rounds):
         for batch in range(batch_size):
             cur_node = s.instance_pointers + batch
             acc = s.instance_accumulators + batch
 
-            # -----------------------------------------------------------------
-            # STEP 2: Load the value stored at current tree node
-            # -----------------------------------------------------------------
-            # node_val = mem[forest_values_p + idx]
-            # The tree is stored as a flat array; idx is the node index
-            body.append(("alu", ("+", s.tmp_addr, kb.scratch["forest_values_p"], cur_node)))
-            body.append(("load", ("load", s.tmp_node_val, s.tmp_addr))) # this load is (mostly) necessary
-            body.append(("debug", ("compare", s.tmp_node_val, (round, batch, "node_val"))))
+            # Load the value stored at current tree node
+            loop_slots.append(("alu", ("+", s.tmp_addr, kb.scratch["forest_values_p"], cur_node)))
+            loop_slots.append(("load", ("load", s.tmp_node_val, s.tmp_addr)))
+            loop_slots.append(("debug", ("compare", s.tmp_node_val, (round, batch, "node_val"))))
 
-            # -----------------------------------------------------------------
-            # STEP 3: XOR with node value and apply hash function
-            # -----------------------------------------------------------------
-            # val = myhash(val ^ node_val)
-            # XOR mixes in the tree node's value, then hash scrambles it
-            body.append(("alu", ("^", acc, acc, s.tmp_node_val)))
-            body.extend(build_hash(acc, s.tmp1, s.tmp2, round, batch, kb.scratch_const))
-            body.append(("debug", ("compare", acc, (round, batch, "hashed_val"))))
+            # XOR with node value and apply hash function
+            loop_slots.append(("alu", ("^", acc, acc, s.tmp_node_val)))
+            loop_slots.extend(build_hash(acc, s.tmp1, s.tmp2, round, batch, kb.scratch_const))
+            loop_slots.append(("debug", ("compare", acc, (round, batch, "hashed_val"))))
 
-            # -----------------------------------------------------------------
-            # STEP 4: Compute next tree index based on hash parity
-            # -----------------------------------------------------------------
-            # idx = 2*idx + (1 if val % 2 == 0 else 2)
-            # If hash is even, go to left child (2*idx + 1)
-            # If hash is odd, go to right child (2*idx + 2)
-            body.append(("alu", ("%", s.tmp1, acc, s.two_const)))      # tmp1 = val % 2
-            body.append(("alu", ("+", s.tmp3, s.tmp1, s.one_const)))  # tmp3 = (0 or 1 + 1) = (1 or 2)
-            # TODO: FMA?
-            body.append(("alu", ("*", cur_node, cur_node, s.two_const)))   # idx = 2 * idx
-            body.append(("alu", ("+", cur_node, cur_node, s.tmp3)))        # idx = 2*idx + tmp3
-            body.append(("debug", ("compare", cur_node, (round, batch, "next_idx"))))
+            # Compute next tree index based on hash parity
+            loop_slots.append(("alu", ("%", s.tmp1, acc, s.two_const)))
+            loop_slots.append(("alu", ("+", s.tmp3, s.tmp1, s.one_const)))
+            loop_slots.append(("alu", ("*", cur_node, cur_node, s.two_const)))
+            loop_slots.append(("alu", ("+", cur_node, cur_node, s.tmp3)))
+            loop_slots.append(("debug", ("compare", cur_node, (round, batch, "next_idx"))))
 
-            # -----------------------------------------------------------------
-            # STEP 5: Wrap index back to root if we fell off the tree
-            # -----------------------------------------------------------------
-            # idx = 0 if idx >= n_nodes else idx
-            # If we've gone past the leaves, wrap back to root
-            #TODO: this could be a single mod, or fully unrolled or something
-            body.append(("alu", ("<", s.tmp1, cur_node, kb.scratch["n_nodes"])))  # tmp1 = idx < n_nodes
-            body.append(("flow", ("select", cur_node, s.tmp1, cur_node, s.zero_const)))  # idx = idx or 0
-            body.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
+            # Wrap index back to root if we fell off the tree
+            loop_slots.append(("alu", ("<", s.tmp1, cur_node, kb.scratch["n_nodes"])))
+            loop_slots.append(("flow", ("select", cur_node, s.tmp1, cur_node, s.zero_const)))
+            loop_slots.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
 
+    kb.instrs.extend(kb.build(loop_slots))
 
-    # store values in their output locations
-    # TODO: batch this, etc etc
-    for batch in range(batch_size):
-        batch_const = kb.scratch_const(batch)
-        body.append(("alu", ("+", s.tmp_addr, kb.scratch["inp_values_p"], batch_const)))
-        body.append(("store", ("store", s.tmp_addr, s.instance_accumulators + batch)))
-        
     # =========================================================================
-    # FINALIZE: Convert slot list to instruction bundles
+    # STORE: Write batch accumulators back to memory
     # =========================================================================
-    # kb.build() takes our list of (engine, slot) tuples and packages them
-    # into instruction bundles. Currently each slot becomes its own bundle
-    # (no parallelism), but this could be optimized to pack multiple
-    # independent operations into the same cycle.
-    body_instrs = kb.build(body)
-    kb.instrs.extend(body_instrs)
+    kb.instrs.extend(build_batch_store(kb, batch_size, s))
 
-    # Final pause for debugging - matches the final yield in reference_kernel2
     kb.instrs.append({"flow": [("pause",)]})
