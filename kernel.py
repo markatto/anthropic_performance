@@ -69,7 +69,6 @@ Data sections:
 =============================================================================
 """
 
-from dataclasses import dataclass
 from typing import Callable
 
 from problem import HASH_STAGES
@@ -89,22 +88,36 @@ HEADER_FIELDS = [
 ]
 
 
-@dataclass
 class ScratchLayout:
-    """Scratch space addresses allocated during kernel setup."""
-    # temporaries (reused across iterations)
-    tmp1: int
-    tmp2: int
-    tmp3: int
-    tmp_node_val: int
-    tmp_addr: int
-    # constants
-    zero_const: int
-    one_const: int
-    two_const: int
-    # per-batch arrays
-    instance_pointers: int
-    instance_accumulators: int
+    """Scratch space addresses allocated during kernel setup.
+
+    Allocates all scratch registers and emits header-load instructions into kb.
+    """
+    def __init__(self, kb, batch_size: int):
+        alloc = kb.alloc_scratch
+        # temporaries (reused across iterations)
+        self.tmp1 = alloc("tmp1")
+        self.tmp2 = alloc("tmp2")
+        self.tmp3 = alloc("tmp3")
+
+        # load the memory header into named scratch slots
+        for i, name in enumerate(HEADER_FIELDS):
+            alloc(name, 1)
+            kb.add("load", ("const", self.tmp1, i))
+            kb.add("load", ("load", kb.scratch[name], self.tmp1))
+
+        kb.add("flow", ("pause",))
+        kb.add("debug", ("comment", "Starting loop"))
+
+        self.tmp_node_val = alloc("tmp_node_val")
+        self.tmp_addr = alloc("tmp_addr")
+        # constants
+        self.zero_const = kb.scratch_const(0)
+        self.one_const = kb.scratch_const(1)
+        self.two_const = kb.scratch_const(2)
+        # per-batch arrays
+        self.instance_pointers = alloc("instance_pointers", batch_size)
+        self.instance_accumulators = alloc("instance_accumulators", batch_size)
 
 
 def build_hash(
@@ -136,33 +149,6 @@ def build_hash(
     return slots
 
 
-def setup_scratch(kb, batch_size: int) -> ScratchLayout:
-    """Allocate scratch registers and load header/constants. Emits init instructions into kb."""
-    tmp1 = kb.alloc_scratch("tmp1")
-    tmp2 = kb.alloc_scratch("tmp2")
-    tmp3 = kb.alloc_scratch("tmp3")
-
-    # Load the memory header into named scratch slots
-    for i, name in enumerate(HEADER_FIELDS):
-        kb.alloc_scratch(name, 1)
-        kb.add("load", ("const", tmp1, i))
-        kb.add("load", ("load", kb.scratch[name], tmp1))
-
-    kb.add("flow", ("pause",))
-    kb.add("debug", ("comment", "Starting loop"))
-
-    return ScratchLayout(
-        tmp1=tmp1, tmp2=tmp2, tmp3=tmp3,
-        tmp_node_val=kb.alloc_scratch("tmp_node_val"),
-        tmp_addr=kb.alloc_scratch("tmp_addr"),
-        zero_const=kb.scratch_const(0),
-        one_const=kb.scratch_const(1),
-        two_const=kb.scratch_const(2),
-        instance_pointers=kb.alloc_scratch("instance_pointers", batch_size),
-        instance_accumulators=kb.alloc_scratch("instance_accumulators", batch_size),
-    )
-
-
 def build_batch_preload(
     kb, batch_size: int, s: ScratchLayout,
 ) -> list[Instruction]:
@@ -191,7 +177,7 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
         batch_size: number of elements to process in parallel
         rounds: number of iterations
     """
-    s = setup_scratch(kb, batch_size)
+    s = ScratchLayout(kb, batch_size)
 
     # =========================================================================
     # MAIN LOOP BODY
