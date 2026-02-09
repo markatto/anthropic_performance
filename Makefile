@@ -29,11 +29,11 @@ ref:
 
 # Lint
 lint:
-	ruff check kernel.py
+	ruff check kernel.py loops/
 
 # Type check
 typecheck:
-	mypy --follow-imports=silent kernel.py
+	mypy --follow-imports=silent kernel.py loops/
 
 # Clean generated files
 clean:

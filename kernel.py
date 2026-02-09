@@ -69,9 +69,9 @@ Data sections:
 =============================================================================
 """
 
-from typing import Callable
+from problem import VLEN
 
-from problem import HASH_STAGES, VLEN
+from loops import build_main_loop_unrolled
 
 Slot = tuple
 Instruction = tuple[str, Slot]  # ("engine", (op, ...))
@@ -112,35 +112,6 @@ class ScratchLayout:
         self.instance_accumulators = alloc("instance_accumulators", batch_size)
 
 
-def build_hash(
-    val_addr: int,
-    tmp1: int,
-    tmp2: int,
-    round: int,
-    batch: int,
-    const_fn: Callable[[int], int],
-) -> list[Instruction]:
-    """
-    Generate instructions for the 6-stage hash function.
-
-    Each stage computes:
-        tmp1 = val op1 const1    (e.g., val + 0x7ED55D16)
-        tmp2 = val op3 const3    (e.g., val << 12)
-        val  = tmp1 op2 tmp2     (e.g., tmp1 + tmp2)
-
-    The operations mix addition, XOR, and bit shifts to thoroughly
-    scramble the input value. See HASH_STAGES in problem.py for the
-    specific constants and operations used.
-    """
-    slots: list[Instruction] = []
-    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-        slots.append(("alu", (op1, tmp1, val_addr, const_fn(val1))))
-        slots.append(("alu", (op3, tmp2, val_addr, const_fn(val3))))
-        slots.append(("alu", (op2, val_addr, tmp1, tmp2)))
-        slots.append(("debug", ("compare", val_addr, (round, batch, "hash_stage", hi))))
-    return slots
-
-
 def build_batch_preload(
     kb, batch_size: int, s: ScratchLayout,
 ) -> list[Bundle]:
@@ -150,7 +121,6 @@ def build_batch_preload(
     (2 vloads per cycle). Reads and increments happen in the same bundle
     since reads occur before writes commit.
     """
-
 
     #TODO: s.inp_indices_p / s.inp_values_p directly for the first vload?
     assert batch_size % VLEN == 0
@@ -199,93 +169,6 @@ def build_batch_store(
                     ("+", addr2, addr2, vlen2_const)],
         })
     return instrs
-
-
-def build_parity_index(
-    s: ScratchLayout, acc: int, cur_node: int,
-) -> list[Instruction]:
-    """Compute next tree index from hash parity: idx = 2*idx + (1 if hash%2==0 else 2)."""
-    return [
-        ("alu", ("%", s.tmp1, acc, s.two_const)),
-        ("alu", ("+", s.tmp3, s.tmp1, s.one_const)),
-        ("alu", ("*", cur_node, cur_node, s.two_const)),
-        ("alu", ("+", cur_node, cur_node, s.tmp3)),
-    ]
-
-
-def build_main_loop_scalar(
-    s: ScratchLayout,
-    batch_size: int,
-    rounds: int,
-    const_fn: Callable[[int], int],
-) -> list[Instruction]:
-    """Fully unrolled scalar main loop. Returns flat slots for packing by caller."""
-    slots: list[Instruction] = []
-    for round in range(rounds):
-        for batch in range(batch_size):
-            cur_node = s.instance_pointers + batch
-            acc = s.instance_accumulators + batch
-
-            # Load the value stored at current tree node
-            slots.append(("alu", ("+", s.tmp_addr, s.forest_values_p, cur_node)))
-            slots.append(("load", ("load", s.tmp_node_val, s.tmp_addr)))
-            slots.append(("debug", ("compare", s.tmp_node_val, (round, batch, "node_val"))))
-
-            # XOR with node value and apply hash function
-            slots.append(("alu", ("^", acc, acc, s.tmp_node_val)))
-            slots.extend(build_hash(acc, s.tmp1, s.tmp2, round, batch, const_fn))
-            slots.append(("debug", ("compare", acc, (round, batch, "hashed_val"))))
-
-            # Compute next tree index and wrap
-            slots.extend(build_parity_index(s, acc, cur_node))
-            slots.append(("debug", ("compare", cur_node, (round, batch, "next_idx"))))
-            slots.append(("alu", ("<", s.tmp1, cur_node, s.n_nodes)))
-            slots.append(("flow", ("select", cur_node, s.tmp1, cur_node, s.zero_const)))
-            slots.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
-    return slots
-
-
-def build_main_loop_unrolled(
-    s: ScratchLayout,
-    batch_size: int,
-    rounds: int,
-    forest_height: int,
-    const_fn: Callable[[int], int],
-) -> list[Instruction]:
-    """Scalar main loop with depth-aware wrap elimination.
-
-    Since all batch indices start at root (depth 0), we can track depth
-    statically and eliminate all flow ops:
-    - Normal rounds (depth < forest_height): no wrap check needed
-    - Wrap rounds (depth == forest_height): force idx = 0 after index computation
-    """
-    slots: list[Instruction] = []
-    depth = 0
-    for round in range(rounds):
-        is_wrap = (depth == forest_height)
-        for batch in range(batch_size):
-            cur_node = s.instance_pointers + batch
-            acc = s.instance_accumulators + batch
-
-            # Load the value stored at current tree node
-            slots.append(("alu", ("+", s.tmp_addr, s.forest_values_p, cur_node)))
-            slots.append(("load", ("load", s.tmp_node_val, s.tmp_addr)))
-            slots.append(("debug", ("compare", s.tmp_node_val, (round, batch, "node_val"))))
-
-            # XOR with node value and apply hash function
-            slots.append(("alu", ("^", acc, acc, s.tmp_node_val)))
-            slots.extend(build_hash(acc, s.tmp1, s.tmp2, round, batch, const_fn))
-            slots.append(("debug", ("compare", acc, (round, batch, "hashed_val"))))
-
-            # Compute next tree index
-            slots.extend(build_parity_index(s, acc, cur_node))
-            slots.append(("debug", ("compare", cur_node, (round, batch, "next_idx"))))
-            if is_wrap:
-                slots.append(("alu", ("+", cur_node, s.zero_const, s.zero_const)))
-            slots.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
-
-        depth = 0 if is_wrap else depth + 1
-    return slots
 
 
 def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
