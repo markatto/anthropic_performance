@@ -71,7 +71,7 @@ Data sections:
 
 from typing import Callable
 
-from problem import HASH_STAGES
+from problem import HASH_STAGES, VLEN
 
 Slot = tuple
 Instruction = tuple[str, Slot]  # ("engine", (op, ...))
@@ -153,28 +153,57 @@ def build_hash(
 def build_batch_preload(
     kb, batch_size: int, s: ScratchLayout,
 ) -> list[Bundle]:
-    """Load batch indices and accumulators from memory into scratch."""
-    #TODO vload
-    instrs: list[Bundle] = []
-    for batch in range(batch_size):
-        batch_const = kb.scratch_const(batch)
-        instrs.append({"alu": [("+", s.tmp_addr, kb.scratch["inp_indices_p"], batch_const)]})
-        instrs.append({"load": [("load", s.instance_pointers + batch, s.tmp_addr)]})
-        instrs.append({"alu": [("+", s.tmp_addr, kb.scratch["inp_values_p"], batch_const)]})
-        instrs.append({"load": [("load", s.instance_accumulators + batch, s.tmp_addr)]})
+    """Load batch indices and accumulators from memory into scratch via vload.
+
+    Uses 2 running address registers, loading both arrays in parallel
+    (2 vloads per cycle). Reads and increments happen in the same bundle
+    since reads occur before writes commit.
+    """
+    assert batch_size % VLEN == 0
+    vlen_const = kb.scratch_const(VLEN)
+    addr_i, addr_v = s.tmp1, s.tmp2
+
+    instrs: list[Bundle] = [
+        # Copy base pointers into running address registers
+        {"alu": [("+", addr_i, kb.scratch["inp_indices_p"], s.zero_const),
+                 ("+", addr_v, kb.scratch["inp_values_p"], s.zero_const)]},
+    ]
+    for i in range(batch_size // VLEN):
+        off = i * VLEN
+        instrs.append({
+            "load": [("vload", s.instance_pointers + off, addr_i),
+                     ("vload", s.instance_accumulators + off, addr_v)],
+            "alu": [("+", addr_i, addr_i, vlen_const),
+                    ("+", addr_v, addr_v, vlen_const)],
+        })
     return instrs
 
 
 def build_batch_store(
     kb, batch_size: int, s: ScratchLayout,
 ) -> list[Bundle]:
-    """Store batch accumulators back to memory."""
-    #TODO vstore
-    instrs: list[Bundle] = []
-    for batch in range(batch_size):
-        batch_const = kb.scratch_const(batch)
-        instrs.append({"alu": [("+", s.tmp_addr, kb.scratch["inp_values_p"], batch_const)]})
-        instrs.append({"store": [("store", s.tmp_addr, s.instance_accumulators + batch)]})
+    """Store batch accumulators back to memory via vstore.
+
+    Uses 2 interleaved address registers to fill both store slots per cycle.
+    """
+    assert batch_size % (VLEN * 2) == 0
+    vlen2_const = kb.scratch_const(VLEN * 2)
+    vlen_const = kb.scratch_const(VLEN)
+    addr1, addr2 = s.tmp1, s.tmp2
+
+    instrs: list[Bundle] = [
+        # addr1 = base, addr2 = base + VLEN
+        {"alu": [("+", addr1, kb.scratch["inp_values_p"], s.zero_const),
+                 ("+", addr2, kb.scratch["inp_values_p"], vlen_const)]},
+    ]
+    for i in range(batch_size // VLEN // 2):
+        off = i * VLEN * 2
+        instrs.append({
+            "store": [("vstore", addr1, s.instance_accumulators + off),
+                      ("vstore", addr2, s.instance_accumulators + off + VLEN)],
+            "alu": [("+", addr1, addr1, vlen2_const),
+                    ("+", addr2, addr2, vlen2_const)],
+        })
     return instrs
 
 
