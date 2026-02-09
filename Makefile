@@ -1,4 +1,6 @@
-.PHONY: test cycles trace clean correctness
+.PHONY: all test cycles trace clean correctness watch ref lint typecheck
+
+all: test lint typecheck
 
 # Run the cycle count test (main benchmark)
 cycles:
@@ -24,6 +26,14 @@ watch:
 # Run reference kernel tests
 ref:
 	python perf_takehome.py Tests.test_ref_kernels
+
+# Lint
+lint:
+	ruff check kernel.py
+
+# Type check
+typecheck:
+	mypy --follow-imports=silent kernel.py
 
 # Clean generated files
 clean:
