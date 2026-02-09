@@ -78,48 +78,35 @@ Instruction = tuple[str, Slot]  # ("engine", (op, ...))
 Bundle = dict[str, list[Slot]]  # {"engine": [(op, ...), ...], ...}
 
 
-HEADER_FIELDS = [
-    "rounds",          # mem[0]: number of traversal rounds
-    "n_nodes",         # mem[1]: total nodes in tree
-    "batch_size",      # mem[2]: number of parallel traversals
-    "forest_height",   # mem[3]: tree height
-    "forest_values_p", # mem[4]: pointer to tree node values
-    "inp_indices_p",   # mem[5]: pointer to current indices for each traversal
-    "inp_values_p",    # mem[6]: pointer to current values for each traversal
-]
+HEADER_SIZE = 7
 
 
 class ScratchLayout:
     """Scratch space addresses allocated during kernel setup.
 
-    Allocates all scratch registers and emits header-load instructions into kb.
+    All header values are known at build time, so we use scratch_const
+    instead of loading from memory.
     """
-    def __init__(self, kb, batch_size: int):
+    def __init__(self, kb, n_nodes: int, batch_size: int):
         alloc = kb.alloc_scratch
         # temporaries (reused across iterations)
         self.tmp1 = alloc("tmp1")
         self.tmp2 = alloc("tmp2")
         self.tmp3 = alloc("tmp3")
-
-        # Load the memory header into named scratch slots.
-        # Pipeline: each cycle loads field[i] while computing address for field[i+1].
-        for i, name in enumerate(HEADER_FIELDS):
-            alloc(name, 1)
-        kb.instrs.append({"load": [("const", self.tmp1, 0)]})
-        for i, name in enumerate(HEADER_FIELDS):
-            loads: list[Slot] = [("load", kb.scratch[name], self.tmp1)]
-            if i + 1 < len(HEADER_FIELDS):
-                loads.append(("const", self.tmp1, i + 1))
-            kb.instrs.append({"load": loads})
-
-        kb.instrs.append({"flow": [("pause",)]})
-
         self.tmp_node_val = alloc("tmp_node_val")
         self.tmp_addr = alloc("tmp_addr")
-        # constants
+        # memory layout pointers (precomputed from known structure)
+        self.forest_values_p = kb.scratch_const(HEADER_SIZE)
+        self.inp_indices_p = kb.scratch_const(HEADER_SIZE + n_nodes)
+        self.inp_values_p = kb.scratch_const(HEADER_SIZE + n_nodes + batch_size)
+        self.n_nodes = kb.scratch_const(n_nodes)
+        # small constants
         self.zero_const = kb.scratch_const(0)
         self.one_const = kb.scratch_const(1)
         self.two_const = kb.scratch_const(2)
+
+        kb.instrs.append({"flow": [("pause",)]})
+
         # per-batch arrays
         self.instance_pointers = alloc("instance_pointers", batch_size)
         self.instance_accumulators = alloc("instance_accumulators", batch_size)
@@ -169,8 +156,8 @@ def build_batch_preload(
 
     instrs: list[Bundle] = [
         # Copy base pointers into running address registers
-        {"alu": [("+", addr_i, kb.scratch["inp_indices_p"], s.zero_const),
-                 ("+", addr_v, kb.scratch["inp_values_p"], s.zero_const)]},
+        {"alu": [("+", addr_i, s.inp_indices_p, s.zero_const),
+                 ("+", addr_v, s.inp_values_p, s.zero_const)]},
     ]
     for i in range(batch_size // VLEN):
         off = i * VLEN
@@ -197,8 +184,8 @@ def build_batch_store(
 
     instrs: list[Bundle] = [
         # addr1 = base, addr2 = base + VLEN
-        {"alu": [("+", addr1, kb.scratch["inp_values_p"], s.zero_const),
-                 ("+", addr2, kb.scratch["inp_values_p"], vlen_const)]},
+        {"alu": [("+", addr1, s.inp_values_p, s.zero_const),
+                 ("+", addr2, s.inp_values_p, vlen_const)]},
     ]
     for i in range(batch_size // VLEN // 2):
         off = i * VLEN * 2
@@ -213,8 +200,6 @@ def build_batch_store(
 
 def build_main_loop_scalar(
     s: ScratchLayout,
-    forest_values_p: int,
-    n_nodes: int,
     batch_size: int,
     rounds: int,
     const_fn: Callable[[int], int],
@@ -227,7 +212,7 @@ def build_main_loop_scalar(
             acc = s.instance_accumulators + batch
 
             # Load the value stored at current tree node
-            slots.append(("alu", ("+", s.tmp_addr, forest_values_p, cur_node)))
+            slots.append(("alu", ("+", s.tmp_addr, s.forest_values_p, cur_node)))
             slots.append(("load", ("load", s.tmp_node_val, s.tmp_addr)))
             slots.append(("debug", ("compare", s.tmp_node_val, (round, batch, "node_val"))))
 
@@ -244,7 +229,7 @@ def build_main_loop_scalar(
             slots.append(("debug", ("compare", cur_node, (round, batch, "next_idx"))))
 
             # Wrap index back to root if we fell off the tree
-            slots.append(("alu", ("<", s.tmp1, cur_node, n_nodes)))
+            slots.append(("alu", ("<", s.tmp1, cur_node, s.n_nodes)))
             slots.append(("flow", ("select", cur_node, s.tmp1, cur_node, s.zero_const)))
             slots.append(("debug", ("compare", cur_node, (round, batch, "wrapped_idx"))))
     return slots
@@ -261,14 +246,11 @@ def build_kernel(kb, forest_height: int, n_nodes: int, batch_size: int, rounds: 
         batch_size: number of elements to process in parallel
         rounds: number of iterations
     """
-    s = ScratchLayout(kb, batch_size)
+    s = ScratchLayout(kb, n_nodes, batch_size)
 
     kb.instrs.extend(build_batch_preload(kb, batch_size, s))
 
-    loop_slots = build_main_loop_scalar(
-        s, kb.scratch["forest_values_p"], kb.scratch["n_nodes"],
-        batch_size, rounds, kb.scratch_const,
-    )
+    loop_slots = build_main_loop_scalar(s, batch_size, rounds, kb.scratch_const)
     kb.instrs.extend(kb.build(loop_slots))
 
     kb.instrs.extend(build_batch_store(kb, batch_size, s))
